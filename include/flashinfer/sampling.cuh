@@ -30,6 +30,7 @@
 #include <tuple>
 
 #include "allocator.h"
+#include "bitonic_sort.cuh"
 #include "math.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
@@ -942,6 +943,304 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   }
 }
 
+// Bitonic sort-based Top-K sampling kernel for small vocabularies (d <= 128)
+// This kernel uses register-resident bitonic sort for improved performance
+template <uint32_t VOCAB_SIZE, typename DType, typename IdType>
+__global__ void BitonicTopKSamplingFromProbKernel(DType* probs, IdType* output, IdType* indices,
+                                                  IdType* top_k_arr, uint32_t top_k_val, uint32_t d,
+                                                  uint64_t philox_seed, uint64_t philox_offset) {
+  const uint32_t bx = blockIdx.x;
+  const uint32_t tgx = threadIdx.x;  // thread index within warp (0-31)
+
+  curandStatePhilox4_32_10_t state;
+  curand_init(philox_seed, bx, philox_offset, &state);
+  const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
+  const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+
+  // Bitonic sort works on powers of 2, so we need VOCAB_SIZE to be 64 or 128
+  static_assert(VOCAB_SIZE == 64 || VOCAB_SIZE == 128,
+                "BitonicTopKSamplingFromProb only supports vocab sizes of 64 or 128");
+
+  // Each thread processes VOCAB_SIZE/32 elements
+  constexpr uint32_t ELEMS_PER_THREAD = VOCAB_SIZE / 32;
+
+  // Variables for bitonic sort
+  unsigned int otgx;
+  bool flag;
+
+  if constexpr (VOCAB_SIZE == 64) {
+    // 2 elements per thread (64 total across 32 threads)
+    float k0, k1;  // keys (probabilities)
+    int v0, v1;    // values (indices)
+    float key1, key2;
+    int value1, value2;
+
+    // Load probabilities and indices
+    // Each thread loads 2 consecutive elements
+    uint32_t idx0 = tgx * 2;
+    uint32_t idx1 = tgx * 2 + 1;
+
+    k0 = (idx0 < d) ? static_cast<float>(probs[row_idx * d + idx0]) : 0.0f;
+    k1 = (idx1 < d) ? static_cast<float>(probs[row_idx * d + idx1]) : 0.0f;
+    v0 = idx0;
+    v1 = idx1;
+
+    // Perform bitonic sort (descending order - largest probabilities first)
+    BITONICSORT64_64()
+
+    // IMPORTANT: After bitonic sort, the output layout is:
+    // - k0 at thread i has sorted rank i (positions 0-31, top half)
+    // - k1 at thread i has sorted rank i+32 (positions 32-63, bottom half)
+    // So the sorted positions are NOT [2*i, 2*i+1], but [i, i+32]
+    uint32_t sorted_pos0 = tgx;       // k0 is at rank tgx (0-31)
+    uint32_t sorted_pos1 = tgx + 32;  // k1 is at rank tgx+32 (32-63)
+
+    // Compute sum of top-k elements for this thread
+    // Only include k0 if tgx < k (since k0 has rank tgx)
+    // Only include k1 if tgx + 32 < k (since k1 has rank tgx + 32)
+    float my_k0_contrib = (sorted_pos0 < k) ? k0 : 0.0f;
+    float my_k1_contrib = (sorted_pos1 < k) ? k1 : 0.0f;
+
+    // Warp-level reduction to get total sum of top-k
+    // First sum all k0 contributions, then all k1 contributions
+    float sum_k0 = my_k0_contrib;
+    float sum_k1 = my_k1_contrib;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+      sum_k0 += __shfl_down_sync(0xffffffff, sum_k0, offset);
+      sum_k1 += __shfl_down_sync(0xffffffff, sum_k1, offset);
+    }
+    float topk_sum = __shfl_sync(0xffffffff, sum_k0, 0) + __shfl_sync(0xffffffff, sum_k1, 0);
+
+    // Generate random number for sampling
+    float u = curand_uniform(&state) * topk_sum;
+
+    // For sampling, we need to iterate through elements in sorted order.
+    // The sorted order is: thread 0's k0, thread 1's k0, ..., thread 31's k0,
+    //                       thread 0's k1, thread 1's k1, ..., thread 31's k1
+    //
+    // Compute prefix sum across all k0 values first
+    float prefix_k0 = my_k0_contrib;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+      float tmp = __shfl_up_sync(0xffffffff, prefix_k0, offset);
+      if (tgx >= offset) prefix_k0 += tmp;
+    }
+    // prefix_k0 now contains inclusive prefix sum of k0 contributions
+
+    // Total sum of all k0 contributions (broadcast from thread 31)
+    float total_k0 = __shfl_sync(0xffffffff, prefix_k0, 31);
+
+    // Similarly for k1
+    float prefix_k1 = my_k1_contrib;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+      float tmp = __shfl_up_sync(0xffffffff, prefix_k1, offset);
+      if (tgx >= offset) prefix_k1 += tmp;
+    }
+
+    // Determine if this thread's element is the sampled one
+    // For k0: check if u falls in range (prev_prefix, prefix]
+    int sampled_id = -1;
+
+    // Check k0 (ranks 0-31)
+    // FIX: All threads must participate in __shfl_sync to avoid hangs.
+    // Compute prev_prefix for all threads, then only use it conditionally.
+    {
+      int lane = (tgx > 0) ? (tgx - 1) : 0;
+      float prev_prefix_k0 = __shfl_sync(0xffffffff, prefix_k0, lane);
+      if (tgx == 0) prev_prefix_k0 = 0.0f;
+
+      if (sorted_pos0 < k && prev_prefix_k0 < u && u <= prefix_k0) {
+        sampled_id = v0;
+      }
+    }
+
+    // Check k1 (ranks 32-63)
+    // FIX: Same pattern - all threads participate in shuffle, use result conditionally.
+    {
+      int lane = (tgx > 0) ? (tgx - 1) : 0;
+      float prev_k1 = __shfl_sync(0xffffffff, prefix_k1, lane);
+      float prev_prefix_k1 = (tgx == 0) ? total_k0 : (total_k0 + prev_k1);
+      float curr_prefix_k1 = total_k0 + prefix_k1;
+
+      if (sorted_pos1 < k && sampled_id == -1 && prev_prefix_k1 < u && u <= curr_prefix_k1) {
+        sampled_id = v1;
+      }
+    }
+
+    // Collect result from all threads (find the first thread with a valid sample)
+    // Use warp vote to find if any thread has a sample
+    unsigned int has_sample_mask = __ballot_sync(0xffffffff, sampled_id >= 0);
+    int winner_lane = __ffs(has_sample_mask) - 1;  // Find first set bit (0-indexed)
+
+    int result;
+    if (winner_lane >= 0) {
+      result = __shfl_sync(0xffffffff, sampled_id, winner_lane);
+    } else {
+      // Fallback: return element at rank 0 (thread 0's k0)
+      result = __shfl_sync(0xffffffff, v0, 0);
+    }
+
+    if (tgx == 0) {
+      output[bx] = result;
+    }
+
+  } else if constexpr (VOCAB_SIZE == 128) {
+    // 4 elements per thread (128 total across 32 threads)
+    float k0, k1, k2, k3;  // keys (probabilities)
+    int v0, v1, v2, v3;    // values (indices)
+    float key1, key2;
+    int value1, value2;
+
+    // Load probabilities and indices
+    uint32_t idx0 = tgx * 4;
+    uint32_t idx1 = tgx * 4 + 1;
+    uint32_t idx2 = tgx * 4 + 2;
+    uint32_t idx3 = tgx * 4 + 3;
+
+    k0 = (idx0 < d) ? static_cast<float>(probs[row_idx * d + idx0]) : 0.0f;
+    k1 = (idx1 < d) ? static_cast<float>(probs[row_idx * d + idx1]) : 0.0f;
+    k2 = (idx2 < d) ? static_cast<float>(probs[row_idx * d + idx2]) : 0.0f;
+    k3 = (idx3 < d) ? static_cast<float>(probs[row_idx * d + idx3]) : 0.0f;
+    v0 = idx0;
+    v1 = idx1;
+    v2 = idx2;
+    v3 = idx3;
+
+    // Perform bitonic sort (descending order)
+    BITONICSORT128_128()
+
+    // IMPORTANT: After bitonic sort, the output layout is:
+    // - k0 at thread i has sorted rank i (positions 0-31, highest probs)
+    // - k1 at thread i has sorted rank i+32 (positions 32-63)
+    // - k2 at thread i has sorted rank i+64 (positions 64-95)
+    // - k3 at thread i has sorted rank i+96 (positions 96-127, lowest probs)
+    uint32_t sorted_pos0 = tgx;       // k0 is at rank tgx (0-31)
+    uint32_t sorted_pos1 = tgx + 32;  // k1 is at rank tgx+32 (32-63)
+    uint32_t sorted_pos2 = tgx + 64;  // k2 is at rank tgx+64 (64-95)
+    uint32_t sorted_pos3 = tgx + 96;  // k3 is at rank tgx+96 (96-127)
+
+    // Compute contribution from each register based on whether it's in top-k
+    float my_k0_contrib = (sorted_pos0 < k) ? k0 : 0.0f;
+    float my_k1_contrib = (sorted_pos1 < k) ? k1 : 0.0f;
+    float my_k2_contrib = (sorted_pos2 < k) ? k2 : 0.0f;
+    float my_k3_contrib = (sorted_pos3 < k) ? k3 : 0.0f;
+
+    // Warp-level reduction to get total sum of top-k
+    float sum_k0 = my_k0_contrib;
+    float sum_k1 = my_k1_contrib;
+    float sum_k2 = my_k2_contrib;
+    float sum_k3 = my_k3_contrib;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+      sum_k0 += __shfl_down_sync(0xffffffff, sum_k0, offset);
+      sum_k1 += __shfl_down_sync(0xffffffff, sum_k1, offset);
+      sum_k2 += __shfl_down_sync(0xffffffff, sum_k2, offset);
+      sum_k3 += __shfl_down_sync(0xffffffff, sum_k3, offset);
+    }
+    float topk_sum = __shfl_sync(0xffffffff, sum_k0, 0) + __shfl_sync(0xffffffff, sum_k1, 0) +
+                     __shfl_sync(0xffffffff, sum_k2, 0) + __shfl_sync(0xffffffff, sum_k3, 0);
+
+    // Generate random number for sampling
+    float u = curand_uniform(&state) * topk_sum;
+
+    // Compute prefix sums for each register group
+    // prefix_k0[i] = sum of k0 contributions from threads 0..i
+    float prefix_k0 = my_k0_contrib;
+    float prefix_k1 = my_k1_contrib;
+    float prefix_k2 = my_k2_contrib;
+    float prefix_k3 = my_k3_contrib;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+      float tmp0 = __shfl_up_sync(0xffffffff, prefix_k0, offset);
+      float tmp1 = __shfl_up_sync(0xffffffff, prefix_k1, offset);
+      float tmp2 = __shfl_up_sync(0xffffffff, prefix_k2, offset);
+      float tmp3 = __shfl_up_sync(0xffffffff, prefix_k3, offset);
+      if (tgx >= offset) {
+        prefix_k0 += tmp0;
+        prefix_k1 += tmp1;
+        prefix_k2 += tmp2;
+        prefix_k3 += tmp3;
+      }
+    }
+
+    // Get total sums for each group
+    float total_k0 = __shfl_sync(0xffffffff, prefix_k0, 31);
+    float total_k1 = __shfl_sync(0xffffffff, prefix_k1, 31);
+    float total_k2 = __shfl_sync(0xffffffff, prefix_k2, 31);
+
+    // Determine if this thread's element is the sampled one
+    int sampled_id = -1;
+
+    // Check k0 (ranks 0-31)
+    // FIX: All threads must participate in __shfl_sync to avoid hangs.
+    {
+      int lane = (tgx > 0) ? (tgx - 1) : 0;
+      float prev_prefix_k0 = __shfl_sync(0xffffffff, prefix_k0, lane);
+      if (tgx == 0) prev_prefix_k0 = 0.0f;
+
+      if (sorted_pos0 < k && prev_prefix_k0 < u && u <= prefix_k0) {
+        sampled_id = v0;
+      }
+    }
+
+    // Check k1 (ranks 32-63)
+    {
+      int lane = (tgx > 0) ? (tgx - 1) : 0;
+      float prev_k1 = __shfl_sync(0xffffffff, prefix_k1, lane);
+      float prev_prefix_k1 = (tgx == 0) ? total_k0 : (total_k0 + prev_k1);
+      float curr_prefix_k1 = total_k0 + prefix_k1;
+
+      if (sorted_pos1 < k && sampled_id == -1 && prev_prefix_k1 < u && u <= curr_prefix_k1) {
+        sampled_id = v1;
+      }
+    }
+
+    // Check k2 (ranks 64-95)
+    {
+      int lane = (tgx > 0) ? (tgx - 1) : 0;
+      float prev_k2 = __shfl_sync(0xffffffff, prefix_k2, lane);
+      float base_k2 = total_k0 + total_k1;
+      float prev_prefix_k2 = (tgx == 0) ? base_k2 : (base_k2 + prev_k2);
+      float curr_prefix_k2 = base_k2 + prefix_k2;
+
+      if (sorted_pos2 < k && sampled_id == -1 && prev_prefix_k2 < u && u <= curr_prefix_k2) {
+        sampled_id = v2;
+      }
+    }
+
+    // Check k3 (ranks 96-127)
+    {
+      int lane = (tgx > 0) ? (tgx - 1) : 0;
+      float prev_k3 = __shfl_sync(0xffffffff, prefix_k3, lane);
+      float base_k3 = total_k0 + total_k1 + total_k2;
+      float prev_prefix_k3 = (tgx == 0) ? base_k3 : (base_k3 + prev_k3);
+      float curr_prefix_k3 = base_k3 + prefix_k3;
+
+      if (sorted_pos3 < k && sampled_id == -1 && prev_prefix_k3 < u && u <= curr_prefix_k3) {
+        sampled_id = v3;
+      }
+    }
+
+    // Collect result from all threads (find the first thread with a valid sample)
+    unsigned int has_sample_mask = __ballot_sync(0xffffffff, sampled_id >= 0);
+    int winner_lane = __ffs(has_sample_mask) - 1;
+
+    int result;
+    if (winner_lane >= 0) {
+      result = __shfl_sync(0xffffffff, sampled_id, winner_lane);
+    } else {
+      // Fallback: return element at rank 0 (thread 0's k0)
+      result = __shfl_sync(0xffffffff, v0, 0);
+    }
+
+    if (tgx == 0) {
+      output[bx] = result;
+    }
+  }
+}
+
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
@@ -1448,6 +1747,26 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
                                  uint32_t batch_size, uint32_t top_k_val, uint32_t d,
                                  bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
                                  cudaStream_t stream = 0) {
+  // Use bitonic sort-based kernel for small vocabulary sizes
+  if (d == 64) {
+    dim3 nblks(batch_size);
+    dim3 nthrs(32);  // One warp per batch element
+    void* args[] = {&probs,     &output, &indices,     &top_k_arr,
+                    &top_k_val, &d,      &philox_seed, &philox_offset};
+    auto kernel = BitonicTopKSamplingFromProbKernel<64, T, IdType>;
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+    return cudaSuccess;
+  } else if (d == 128) {
+    dim3 nblks(batch_size);
+    dim3 nthrs(32);  // One warp per batch element
+    void* args[] = {&probs,     &output, &indices,     &top_k_arr,
+                    &top_k_val, &d,      &philox_seed, &philox_offset};
+    auto kernel = BitonicTopKSamplingFromProbKernel<128, T, IdType>;
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+    return cudaSuccess;
+  }
+
+  // Fall back to original implementation for other vocabulary sizes
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
